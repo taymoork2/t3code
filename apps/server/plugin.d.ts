@@ -34,11 +34,13 @@ export interface PluginCommandContext {
   readonly viewId?: string;
   readonly cardId?: string;
   readonly filePath?: string;
+  readonly data?: PluginJson;
 }
 
 export interface PluginCommandResult {
   readonly message: string;
   readonly tone: PluginCommandTone;
+  readonly data?: PluginJson;
 }
 
 export interface PluginEffect<out A> {

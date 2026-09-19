@@ -12,7 +12,7 @@ export const PluginCommand = Schema.Struct({
   id: PluginCommandId,
   label: TrimmedNonEmptyString.check(Schema.isMaxLength(120)),
   description: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(500))),
-  surfaces: Schema.Array(PluginCommandSurface).check(Schema.isMinLength(1)),
+  surfaces: Schema.Array(PluginCommandSurface),
 });
 export type PluginCommand = typeof PluginCommand.Type;
 
@@ -28,6 +28,7 @@ export const PluginCommandInvocationContext = Schema.Struct({
   viewId: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(200))),
   cardId: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(200))),
   filePath: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(1_000))),
+  data: Schema.optional(Schema.Json),
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type PluginCommandInvocationContext = typeof PluginCommandInvocationContext.Type;
 
@@ -41,6 +42,7 @@ export type PluginCommandInvokeInput = typeof PluginCommandInvokeInput.Type;
 export const PluginCommandInvocationResult = Schema.Struct({
   message: TrimmedNonEmptyString.check(Schema.isMaxLength(500)),
   tone: Schema.Literals(["info", "success"]),
+  data: Schema.optional(Schema.Json),
 });
 export type PluginCommandInvocationResult = typeof PluginCommandInvocationResult.Type;
 

@@ -61,6 +61,29 @@ describe("plugin command contracts", () => {
     ).toEqual({ message: "Command completed.", tone: "success" });
   });
 
+  it.effect("carries internal command data without exposing a client surface", () =>
+    Effect.gen(function* () {
+      const catalog = yield* decodeCatalog({
+        generation: 5,
+        commands: [{ id: "dev.tenetfold.invoke", label: "Tenetfold invocation", surfaces: [] }],
+      });
+      const input = decodeInvokeInput({
+        generation: 5,
+        id: "dev.tenetfold.invoke",
+        context: { threadId: "thread-1", data: { phase: "before", provider: "codex" } },
+      });
+      const result = decodeInvocationResult({
+        message: "Profile accepted.",
+        tone: "success",
+        data: { profileId: "ifp_abc" },
+      });
+
+      expect(catalog.commands[0]?.surfaces).toEqual([]);
+      expect(input.context?.data).toEqual({ phase: "before", provider: "codex" });
+      expect(result.data).toEqual({ profileId: "ifp_abc" });
+    }),
+  );
+
   it("derives invocation failure messages from the command id", () => {
     const error = new PluginCommandInvocationError({
       cause: new Error("handler failed"),

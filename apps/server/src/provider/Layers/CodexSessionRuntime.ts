@@ -172,6 +172,7 @@ export interface CodexSessionRuntimeSendTurnInput {
   readonly serviceTier?: CodexServiceTier | undefined;
   readonly effort?: EffectCodexSchema.V2TurnStartParams__ReasoningEffort | undefined;
   readonly interactionMode?: ProviderInteractionMode;
+  readonly developerInstructions?: string | undefined;
 }
 
 export interface CodexThreadTurnSnapshot {
@@ -563,22 +564,29 @@ function buildCodexCollaborationMode(input: {
   readonly model?: string;
   readonly effort?: EffectCodexSchema.V2TurnStartParams__ReasoningEffort;
   readonly browserToolsAvailable?: boolean;
+  readonly developerInstructions?: string;
 }): EffectCodexSchema.V2TurnStartParams__CollaborationMode | undefined {
   if (input.interactionMode === undefined) {
     return undefined;
   }
   const model = normalizeCodexModelSlug(input.model) ?? DEFAULT_MODEL;
   const reasoningEffort = input.effort ?? "medium";
+  const nativeInstructions = buildCodexDeveloperInstructions(
+    input.interactionMode,
+    { model, reasoningEffort },
+    input.browserToolsAvailable ?? true,
+  );
+  const additionalInstructions = input.developerInstructions?.trim();
+  const developerInstructions =
+    additionalInstructions && !nativeInstructions.includes(additionalInstructions)
+      ? `${nativeInstructions}\n\n${additionalInstructions}`
+      : nativeInstructions;
   return {
     mode: input.interactionMode,
     settings: {
       model,
       reasoning_effort: reasoningEffort,
-      developer_instructions: buildCodexDeveloperInstructions(
-        input.interactionMode,
-        { model, reasoningEffort },
-        input.browserToolsAvailable ?? true,
-      ),
+      developer_instructions: developerInstructions,
     },
   };
 }
@@ -595,6 +603,7 @@ export function buildTurnStartParams(input: {
   readonly serviceTier?: CodexServiceTier;
   readonly effort?: EffectCodexSchema.V2TurnStartParams__ReasoningEffort;
   readonly interactionMode?: ProviderInteractionMode;
+  readonly developerInstructions?: string;
   /** Defaults to true so callers that predate the agent-access gate are unchanged. */
   readonly browserToolsAvailable?: boolean;
 }): Effect.Effect<
@@ -618,6 +627,7 @@ export function buildTurnStartParams(input: {
     ...(input.model ? { model: input.model } : {}),
     ...(input.effort ? { effort: input.effort } : {}),
     browserToolsAvailable: input.browserToolsAvailable ?? true,
+    ...(input.developerInstructions ? { developerInstructions: input.developerInstructions } : {}),
   });
 
   return decodeCodexTurnStartParamsWithCollaborationMode({
@@ -2114,6 +2124,9 @@ export const makeCodexSessionRuntime = (
             ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),
             ...(input.effort ? { effort: input.effort } : {}),
             ...(input.interactionMode ? { interactionMode: input.interactionMode } : {}),
+            ...(input.developerInstructions
+              ? { developerInstructions: input.developerInstructions }
+              : {}),
             // Derived from the session's own MCP configuration rather than the
             // setting, so the prompt describes the tools this turn actually
             // has even if the setting changed after the session started.

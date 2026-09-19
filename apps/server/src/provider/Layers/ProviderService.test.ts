@@ -4,6 +4,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import type {
+  PluginCommandInvokeInput,
   ProviderApprovalDecision,
   ProviderRuntimeEvent,
   ProviderSendTurnInput,
@@ -14,7 +15,6 @@ import type {
 } from "@t3tools/contracts";
 import {
   ApprovalRequestId,
-  EnvironmentId,
   EventId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -45,7 +45,10 @@ import {
   ProviderValidationError,
   type ProviderAdapterError,
 } from "../Errors.ts";
-import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+import type {
+  ProviderAdapterSendTurnInput,
+  ProviderAdapterShape,
+} from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
@@ -61,6 +64,7 @@ import {
 import * as ServerConfig from "../../config.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
+import * as PluginCommandCatalog from "../../plugins/PluginCommandCatalog.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
 
 const defaultServerSettingsLayer = ServerSettings.ServerSettingsService.layerTest();
@@ -120,7 +124,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
 
   const sendTurn = vi.fn(
     (
-      input: ProviderSendTurnInput,
+      input: ProviderAdapterSendTurnInput,
     ): Effect.Effect<ProviderTurnStartResult, ProviderAdapterError> => {
       if (!sessions.has(input.threadId)) {
         return Effect.fail(
@@ -283,7 +287,9 @@ const hasMetricSnapshot = (
       Object.entries(attributes).every(([key, value]) => snapshot.attributes?.[key] === value),
   );
 
-function makeProviderServiceLayer() {
+function makeProviderServiceLayer(
+  pluginCommands?: PluginCommandCatalog.PluginCommandCatalog["Service"],
+) {
   const codex = makeFakeCodexAdapter();
   const claude = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
   const cursor = makeFakeCodexAdapter(CURSOR_DRIVER);
@@ -304,7 +310,7 @@ function makeProviderServiceLayer() {
 
   const layer = it.layer(
     Layer.mergeAll(
-      makeProviderServiceLive().pipe(
+      makeProviderServiceLive({ pluginCommands }).pipe(
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
         Layer.provide(defaultServerSettingsLayer),
@@ -605,6 +611,68 @@ it.effect("ProviderServiceLive rejects new sessions for disabled custom instance
 );
 
 const routing = makeProviderServiceLayer();
+const commandData = (input: PluginCommandInvokeInput): Readonly<Record<string, unknown>> | null => {
+  const data = input.context?.data;
+  return data !== null && typeof data === "object" && !Array.isArray(data)
+    ? (data as Readonly<Record<string, unknown>>)
+    : null;
+};
+const tenetfoldInvoke = vi.fn((input: PluginCommandInvokeInput) => {
+  const data = commandData(input);
+  return Effect.succeed({
+    message: "Tenetfold profile accepted.",
+    tone: "success" as const,
+    data:
+      data?.phase === "before"
+        ? {
+            schemaVersion: 1,
+            phase: "before",
+            disposition: "accept",
+            integrationOwnerId: "surface.t3code.preview",
+            profileId: `ifp_${"a".repeat(64)}`,
+            profileDigest: { algorithm: "sha256", value: "b".repeat(64) },
+            translation: {
+              model: "gpt-5.6-sol",
+              reasoningEffort: "high",
+              developerInstructions: "Keep the canary bounded.",
+              requestedConfiguration: {
+                model: "model.gpt-5.6-sol",
+                reasoningEffort: "high",
+                instructionIds: ["instruction.canary"],
+              },
+              materializedConfiguration: {
+                model: "gpt-5.6-sol",
+                reasoningEffort: "high",
+                instructionIds: ["instruction.canary"],
+              },
+            },
+          }
+        : {
+            phase: typeof data?.phase === "string" ? data.phase : null,
+          },
+  });
+});
+const tenetfoldPluginCommands = PluginCommandCatalog.PluginCommandCatalog.of({
+  list: Effect.succeed({
+    generation: 7,
+    commands: [
+      {
+        id: "dev.tenetfold.provider-invocation",
+        label: "Tenetfold provider invocation",
+        surfaces: [],
+      },
+    ],
+  }),
+  ui: Effect.die("unused"),
+  composition: Effect.die("unused"),
+  changes: Stream.empty,
+  uiChanges: Stream.empty,
+  notifications: Stream.empty,
+  notify: () => Effect.die("unused"),
+  invoke: tenetfoldInvoke,
+  reconcile: () => Effect.die("unused"),
+});
+const tenetfoldRouting = makeProviderServiceLayer(tenetfoldPluginCommands);
 
 it.effect(
   "ProviderServiceLive uploads feedback through the adapter that recovered the session",
@@ -926,6 +994,98 @@ it.effect(
       NodeFS.rmSync(tempDir, { recursive: true, force: true });
     }).pipe(Effect.provide(NodeServices.layer)),
 );
+
+tenetfoldRouting.layer("ProviderServiceLive Tenetfold canary", (it) => {
+  it.effect("applies one accepted profile to a Codex turn", () =>
+    Effect.gen(function* () {
+      tenetfoldInvoke.mockClear();
+      tenetfoldRouting.codex.sendTurn.mockClear();
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-tenetfold-canary");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      yield* provider.sendTurn({ threadId, input: "Run the bounded canary." });
+
+      const sent = tenetfoldRouting.codex.sendTurn.mock.calls[0]?.[0];
+      assert.equal(sent?.modelSelection?.model, "gpt-5.6-sol");
+      assert.deepEqual(sent?.modelSelection?.options, [{ id: "reasoningEffort", value: "high" }]);
+      assert.equal(sent?.influence?.profileId, `ifp_${"a".repeat(64)}`);
+      assert.equal(sent?.influence?.developerInstructions, "Keep the canary bounded.");
+      assert.equal(tenetfoldInvoke.mock.calls.length, 1);
+    }),
+  );
+
+  it.effect("keeps an explicit model and records it as the applied configuration", () =>
+    Effect.gen(function* () {
+      tenetfoldInvoke.mockClear();
+      tenetfoldRouting.codex.sendTurn.mockClear();
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-tenetfold-explicit-model");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      yield* provider.sendTurn({
+        threadId,
+        input: "Keep the explicit model.",
+        modelSelection: createModelSelection(codexInstanceId, "gpt-explicit", [
+          { id: "reasoningEffort", value: "low" },
+        ]),
+      });
+
+      const sent = tenetfoldRouting.codex.sendTurn.mock.calls[0]?.[0];
+      assert.equal(sent?.modelSelection?.model, "gpt-explicit");
+      assert.deepEqual(sent?.modelSelection?.options, [{ id: "reasoningEffort", value: "low" }]);
+      assert.equal(sent?.influence?.requestedConfiguration.model, "model.gpt-5.6-sol");
+      assert.equal(sent?.influence?.materializedConfiguration.model, "gpt-explicit");
+      assert.equal(sent?.influence?.materializedConfiguration.reasoningEffort, "low");
+    }),
+  );
+
+  it.effect("reports the accepted profile outcome and cancellation", () =>
+    Effect.gen(function* () {
+      tenetfoldInvoke.mockClear();
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-tenetfold-outcome");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* provider.sendTurn({ threadId, input: "Run the bounded canary." });
+      yield* provider.interruptTurn({ threadId, turnId: turn.turnId });
+      yield* advanceTestClock(10);
+      tenetfoldRouting.codex.emit({
+        type: "turn.aborted",
+        eventId: asEventId("evt-tenetfold-outcome"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId: turn.turnId,
+        payload: { reason: "cancelled" },
+      });
+      yield* advanceTestClock(20);
+
+      const phases = tenetfoldInvoke.mock.calls.map(([input]) => commandData(input));
+      assert.deepEqual(
+        phases.map((entry) => entry?.phase),
+        ["before", "cancel", "after"],
+      );
+      assert.equal(phases[1]?.profileId, `ifp_${"a".repeat(64)}`);
+      assert.equal(phases[2]?.outcome, "aborted");
+    }),
+  );
+});
 
 routing.layer("ProviderServiceLive routing", (it) => {
   it.effect("routes provider operations and rollback conversation", () =>

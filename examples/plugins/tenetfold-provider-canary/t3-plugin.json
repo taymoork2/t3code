@@ -1,0 +1,21 @@
+{
+  "manifestVersion": 1,
+  "id": "dev.tenetfold.provider-canary",
+  "version": "0.1.0",
+  "apiVersion": 1,
+  "entrypoints": {
+    "server": "./index.ts"
+  },
+  "capabilities": ["t3.commands@1", "t3.ui@1"],
+  "permissions": ["settings:read-write", "filesystem:data"],
+  "contributes": {
+    "commands": ["dev.tenetfold.provider-invocation"],
+    "settings": [
+      "dev.tenetfold.provider-canary.module-path",
+      "dev.tenetfold.provider-canary.request-json",
+      "dev.tenetfold.provider-canary.disposition",
+      "dev.tenetfold.provider-canary.override-json"
+    ]
+  },
+  "composition": []
+}

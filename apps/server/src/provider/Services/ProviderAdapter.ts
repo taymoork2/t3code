@@ -44,6 +44,28 @@ export interface ProviderThreadSnapshot {
   readonly turns: ReadonlyArray<ProviderThreadTurnSnapshot>;
 }
 
+export interface ProviderInfluenceBinding {
+  readonly integrationOwnerId: string;
+  readonly profileId: string;
+  readonly profileDigest: { readonly algorithm: "sha256"; readonly value: string };
+  readonly disposition: "accept" | "reject" | "override";
+  readonly developerInstructions?: string | undefined;
+  readonly requestedConfiguration: {
+    readonly model: string | null;
+    readonly reasoningEffort: string | null;
+    readonly instructionIds: ReadonlyArray<string>;
+  };
+  readonly materializedConfiguration: {
+    readonly model: string | null;
+    readonly reasoningEffort: string | null;
+    readonly instructionIds: ReadonlyArray<string>;
+  };
+}
+
+export type ProviderAdapterSendTurnInput = ProviderSendTurnInput & {
+  readonly influence?: ProviderInfluenceBinding | undefined;
+};
+
 export interface ProviderAdapterShape<TError> {
   /**
    * Provider kind implemented by this adapter.
@@ -62,7 +84,7 @@ export interface ProviderAdapterShape<TError> {
    * Send a turn to an active provider session.
    */
   readonly sendTurn: (
-    input: ProviderSendTurnInput,
+    input: ProviderAdapterSendTurnInput,
   ) => Effect.Effect<ProviderTurnStartResult, TError>;
 
   /**

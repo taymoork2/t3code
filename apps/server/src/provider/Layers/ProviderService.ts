@@ -26,6 +26,7 @@ import {
   type ProviderSession,
 } from "@t3tools/contracts";
 import { causeErrorTag } from "@t3tools/shared/observability";
+import { createModelSelection } from "@t3tools/shared/model";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -49,7 +50,11 @@ import {
   withMetrics,
 } from "../../observability/Metrics.ts";
 import { type ProviderAdapterError, ProviderValidationError } from "../Errors.ts";
-import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+import type {
+  ProviderAdapterSendTurnInput,
+  ProviderAdapterShape,
+  ProviderInfluenceBinding,
+} from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
@@ -59,7 +64,35 @@ import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
 import * as ServerSettings from "../../serverSettings.ts";
+import * as PluginCommandCatalog from "../../plugins/PluginCommandCatalog.ts";
 const isModelSelection = Schema.is(ModelSelection);
+
+const TENETFOLD_PROVIDER_COMMAND_ID = "dev.tenetfold.provider-invocation";
+const NullableString = Schema.Union([Schema.String, Schema.Null]);
+const InfluenceConfiguration = Schema.Struct({
+  model: NullableString,
+  reasoningEffort: NullableString,
+  instructionIds: Schema.Array(Schema.String),
+});
+const TenetfoldBeforeResult = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  phase: Schema.Literal("before"),
+  disposition: Schema.Literals(["accept", "reject", "override"]),
+  integrationOwnerId: Schema.Literal("surface.t3code.preview"),
+  profileId: Schema.String.check(Schema.isPattern(/^ifp_[0-9a-f]{64}$/)),
+  profileDigest: Schema.Struct({
+    algorithm: Schema.Literal("sha256"),
+    value: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/)),
+  }),
+  translation: Schema.Struct({
+    model: NullableString,
+    reasoningEffort: NullableString,
+    developerInstructions: NullableString,
+    requestedConfiguration: InfluenceConfiguration,
+    materializedConfiguration: InfluenceConfiguration,
+  }),
+});
+const decodeTenetfoldBeforeResult = Schema.decodeUnknownEffect(TenetfoldBeforeResult);
 
 /**
  * Hook for tests that want to override the canonical event logger pulled
@@ -68,6 +101,7 @@ const isModelSelection = Schema.is(ModelSelection);
  */
 export interface ProviderServiceLiveOptions {
   readonly canonicalEventLogger?: EventNdjsonLogger;
+  readonly pluginCommands?: PluginCommandCatalog.PluginCommandCatalog["Service"] | undefined;
   /**
    * Overrides MCP credential issuance. The real issuer reads a module-global
    * registry that only a running MCP server installs, which makes the
@@ -227,11 +261,59 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const pluginCommands =
+    options?.pluginCommands ??
+    Option.getOrUndefined(yield* Effect.serviceOption(PluginCommandCatalog.PluginCommandCatalog));
   const issueMcpCredential =
     options?.issueMcpCredential ?? McpSessionRegistry.issueActiveMcpCredential;
   const revokeMcpCredential =
     options?.revokeMcpCredential ?? McpSessionRegistry.revokeActiveMcpThread;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+  const invokeTenetfold = (threadId: ThreadId, data: Schema.Json) => {
+    if (pluginCommands === undefined) return Effect.succeed(Option.none());
+    return Effect.gen(function* () {
+      const catalog = yield* pluginCommands.list;
+      if (!catalog.commands.some((command) => command.id === TENETFOLD_PROVIDER_COMMAND_ID)) {
+        return Option.none();
+      }
+      const result = yield* pluginCommands.invoke({
+        generation: catalog.generation,
+        id: TENETFOLD_PROVIDER_COMMAND_ID,
+        context: { threadId, data },
+      });
+      return Option.some(result.data);
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Tenetfold provider plugin unavailable; continuing natively", {
+          threadId,
+          cause,
+        }).pipe(Effect.as(Option.none())),
+      ),
+    );
+  };
+  const activeInfluences = new Map<
+    ThreadId,
+    { readonly turnId: string; readonly binding: ProviderInfluenceBinding }
+  >();
+  const reportTenetfoldPhase = (
+    phase: "after" | "cancel",
+    threadId: ThreadId,
+    turnId: string,
+    binding: ProviderInfluenceBinding,
+    outcome: string,
+  ) =>
+    invokeTenetfold(threadId, {
+      phase,
+      provider: "codex",
+      turnId,
+      outcome,
+      integrationOwnerId: binding.integrationOwnerId,
+      profileId: binding.profileId,
+      profileDigest: binding.profileDigest,
+      disposition: binding.disposition,
+      requestedConfiguration: binding.requestedConfiguration,
+      materializedConfiguration: binding.materializedConfiguration,
+    }).pipe(Effect.asVoid);
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   /**
    * Attach the `t3-code` MCP server to the session that is about to start.
@@ -344,14 +426,27 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     },
     event: ProviderRuntimeEvent,
   ): Effect.Effect<void> =>
-    Effect.sync(() => correlateRuntimeEventWithInstance(source, event)).pipe(
-      Effect.flatMap((canonicalEvent) =>
-        increment(providerRuntimeEventsTotal, {
-          provider: canonicalEvent.provider,
-          eventType: canonicalEvent.type,
-        }).pipe(Effect.andThen(publishRuntimeEvent(canonicalEvent))),
-      ),
-    );
+    Effect.gen(function* () {
+      const canonicalEvent = correlateRuntimeEventWithInstance(source, event);
+      if (canonicalEvent.type === "turn.completed" || canonicalEvent.type === "turn.aborted") {
+        const active = activeInfluences.get(canonicalEvent.threadId);
+        if (active !== undefined && active.turnId === canonicalEvent.turnId) {
+          yield* reportTenetfoldPhase(
+            "after",
+            canonicalEvent.threadId,
+            active.turnId,
+            active.binding,
+            canonicalEvent.type === "turn.completed" ? canonicalEvent.payload.state : "aborted",
+          );
+          activeInfluences.delete(canonicalEvent.threadId);
+        }
+      }
+      yield* increment(providerRuntimeEventsTotal, {
+        provider: canonicalEvent.provider,
+        eventType: canonicalEvent.type,
+      });
+      yield* publishRuntimeEvent(canonicalEvent);
+    });
 
   // `subscribedAdapters` is our source-of-truth for "which instance adapters
   // are currently wired into the runtime event bus". It both tracks the set
@@ -785,7 +880,73 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       // rather than issuing a new one: sessions that go a long time between
       // browser tool calls used to lose the toolkit outright.
       yield* McpSessionRegistry.touchActiveMcpThread(input.threadId);
-      const turn = yield* routed.adapter.sendTurn(input);
+      const influenceData =
+        routed.adapter.provider === "codex"
+          ? yield* invokeTenetfold(input.threadId, {
+              phase: "before",
+              provider: "codex",
+              explicitModel: input.modelSelection?.model ?? null,
+              explicitReasoningEffort:
+                input.modelSelection?.options?.find(
+                  (option) => option.id === "reasoningEffort" && typeof option.value === "string",
+                )?.value ?? null,
+              interactionMode: input.interactionMode ?? null,
+            })
+          : Option.none();
+      const decodedInfluence = Option.isSome(influenceData)
+        ? Option.getOrUndefined(
+            yield* decodeTenetfoldBeforeResult(influenceData.value).pipe(Effect.option),
+          )
+        : undefined;
+      const shouldApply =
+        decodedInfluence !== undefined && decodedInfluence.disposition !== "reject";
+      const recommendedModel = shouldApply ? decodedInfluence.translation.model : null;
+      const recommendedEffort = shouldApply ? decodedInfluence.translation.reasoningEffort : null;
+      const modelSelection =
+        input.modelSelection ??
+        (recommendedModel === null
+          ? undefined
+          : createModelSelection(
+              routed.instanceId,
+              recommendedModel,
+              recommendedEffort === null
+                ? undefined
+                : [{ id: "reasoningEffort", value: recommendedEffort }],
+            ));
+      const appliedReasoningOption = modelSelection?.options?.find(
+        (option) => option.id === "reasoningEffort",
+      );
+      const appliedReasoningEffort =
+        typeof appliedReasoningOption?.value === "string" ? appliedReasoningOption.value : null;
+      const influence: ProviderInfluenceBinding | undefined =
+        decodedInfluence === undefined
+          ? undefined
+          : {
+              integrationOwnerId: decodedInfluence.integrationOwnerId,
+              profileId: decodedInfluence.profileId,
+              profileDigest: decodedInfluence.profileDigest,
+              disposition: decodedInfluence.disposition,
+              ...(shouldApply && decodedInfluence.translation.developerInstructions !== null
+                ? { developerInstructions: decodedInfluence.translation.developerInstructions }
+                : {}),
+              requestedConfiguration: decodedInfluence.translation.requestedConfiguration,
+              materializedConfiguration: {
+                model: modelSelection?.model ?? null,
+                reasoningEffort: appliedReasoningEffort,
+                instructionIds: shouldApply
+                  ? decodedInfluence.translation.materializedConfiguration.instructionIds
+                  : [],
+              },
+            };
+      const providerInput: ProviderAdapterSendTurnInput = {
+        ...input,
+        ...(modelSelection === undefined ? {} : { modelSelection }),
+        ...(influence === undefined ? {} : { influence }),
+      };
+      const turn = yield* routed.adapter.sendTurn(providerInput);
+      if (influence !== undefined) {
+        activeInfluences.set(input.threadId, { turnId: turn.turnId, binding: influence });
+      }
       yield* directory.upsert({
         threadId: input.threadId,
         provider: routed.adapter.provider,
@@ -849,6 +1010,19 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           "provider.turn_id": input.turnId,
         });
         yield* routed.adapter.interruptTurn(routed.threadId, input.turnId);
+        const active = activeInfluences.get(input.threadId);
+        if (
+          active !== undefined &&
+          (input.turnId === undefined || input.turnId === active.turnId)
+        ) {
+          yield* reportTenetfoldPhase(
+            "cancel",
+            input.threadId,
+            active.turnId,
+            active.binding,
+            "requested",
+          );
+        }
         yield* analytics.record("provider.turn.interrupted", {
           provider: routed.adapter.provider,
         });

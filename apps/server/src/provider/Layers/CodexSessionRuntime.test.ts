@@ -199,6 +199,30 @@ describe("buildTurnStartParams", () => {
     NodeAssert.ok(settings?.developer_instructions?.includes(`as ${DEFAULT_MODEL} with medium`));
   });
 
+  it.effect("adds accepted influence instructions once to the Codex collaboration settings", () =>
+    Effect.gen(function* () {
+      const instruction = "Keep the canary bounded.";
+      const params = yield* buildTurnStartParams({
+        threadId: "provider-thread-1",
+        runtimeMode: "full-access",
+        prompt: "Run it",
+        interactionMode: "default",
+        developerInstructions: instruction,
+      });
+
+      const value = params.collaborationMode?.settings.developer_instructions ?? "";
+      NodeAssert.equal(value.split(instruction).length - 1, 1);
+      NodeAssert.ok(
+        value.includes(
+          buildCodexDeveloperInstructions("default", {
+            model: DEFAULT_MODEL,
+            reasoningEffort: "medium",
+          }),
+        ),
+      );
+    }),
+  );
+
   it.effect("routes approvals to the auto reviewer in auto mode", () =>
     Effect.gen(function* () {
       const params = yield* buildTurnStartParams({

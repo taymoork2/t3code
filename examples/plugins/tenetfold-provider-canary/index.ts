@@ -125,7 +125,7 @@ const activate = ((api) => {
             api.effect.flatMap(api.host.settings.get(OVERRIDE_SETTING), async (overrideSetting) => {
               const modulePath = text(moduleSetting, MODULE_SETTING);
               const request = JSON.parse(text(requestSetting, REQUEST_SETTING)) as unknown;
-              const disposition = text(dispositionSetting, DISPOSITION_SETTING);
+              const disposition = text(dispositionSetting ?? "accept", DISPOSITION_SETTING);
               if (!(["accept", "reject", "override"] as const).includes(disposition as never)) {
                 throw new Error(`Unsupported Tenetfold disposition ${disposition}.`);
               }
